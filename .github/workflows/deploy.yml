@@ -1,0 +1,178 @@
+name: Deploy Azure 3-Tier Web App
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      action:
+        description: 'Choose action'
+        required: true
+        default: 'apply'
+        type: choice
+        options:
+          - apply
+          - destroy
+
+env:
+  # Azure Container Registry — equivalent of AWS ECR
+  ACR_LOGIN_SERVER: ${{ secrets.ACR_LOGIN_SERVER }}     # e.g. montyhallacr.azurecr.io
+  IMAGE_NAME: monty-hall-game
+  TF_WORKING_DIR: ./Terraform
+
+jobs:
+  # ─────────────────────────────────────────────────────
+  # JOB 1: Build Docker image and push to ACR
+  # Equivalent of: Build & Push Docker Image → AWS ECR
+  # ─────────────────────────────────────────────────────
+  build-and-push:
+    name: Build & Push Docker Image to ACR
+    runs-on: ubuntu-latest
+    if: ${{ github.event.inputs.action != 'destroy' }}
+    outputs:
+      image_tag: ${{ steps.meta.outputs.tag }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set image tag (commit SHA — same pattern as original)
+        id: meta
+        run: echo "tag=${{ github.sha }}" >> $GITHUB_OUTPUT
+
+      - name: Log in to Azure Container Registry
+        # Equivalent of: aws ecr get-login-password | docker login
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ secrets.ACR_LOGIN_SERVER }}
+          username: ${{ secrets.ACR_USERNAME }}
+          password: ${{ secrets.ACR_PASSWORD }}
+
+      - name: Build and push Docker image to ACR
+        uses: docker/build-push-action@v5
+        with:
+          context: ./Monty_Hall_Game_Flask_App
+          push: true
+          tags: |
+            ${{ secrets.ACR_LOGIN_SERVER }}/${{ env.IMAGE_NAME }}:${{ steps.meta.outputs.tag }}
+            ${{ secrets.ACR_LOGIN_SERVER }}/${{ env.IMAGE_NAME }}:latest
+
+  # ─────────────────────────────────────────────────────
+  # JOB 2: Terraform Apply — provision Azure infrastructure
+  # Equivalent of: Terraform Apply → AWS resources
+  # ─────────────────────────────────────────────────────
+  terraform:
+    name: Terraform ${{ github.event.inputs.action || 'apply' }}
+    runs-on: ubuntu-latest
+    needs: [build-and-push]
+    if: always() && (needs.build-and-push.result == 'success' || github.event.inputs.action == 'destroy')
+    outputs:
+      bastion_ip: ${{ steps.tf_output.outputs.bastion_ip }}
+      app_vm_1_ip: ${{ steps.tf_output.outputs.app_vm_1_ip }}
+      app_vm_2_ip: ${{ steps.tf_output.outputs.app_vm_2_ip }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_wrapper: false
+
+      - name: Azure Login (Service Principal)
+        # Equivalent of: AWS_ACCESS_KEY_ID + AWS_SECRET_ACCESS_KEY env vars
+        uses: azure/login@v1
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      - name: Export Azure SP credentials for Terraform AzureRM provider
+        run: |
+          echo "ARM_CLIENT_ID=${{ fromJson(secrets.AZURE_CREDENTIALS).clientId }}" >> $GITHUB_ENV
+          echo "ARM_CLIENT_SECRET=${{ fromJson(secrets.AZURE_CREDENTIALS).clientSecret }}" >> $GITHUB_ENV
+          echo "ARM_SUBSCRIPTION_ID=${{ fromJson(secrets.AZURE_CREDENTIALS).subscriptionId }}" >> $GITHUB_ENV
+          echo "ARM_TENANT_ID=${{ fromJson(secrets.AZURE_CREDENTIALS).tenantId }}" >> $GITHUB_ENV
+
+      - name: Terraform Init
+        working-directory: ${{ env.TF_WORKING_DIR }}
+        run: terraform init
+
+      - name: Terraform Plan
+        working-directory: ${{ env.TF_WORKING_DIR }}
+        env:
+          TF_VAR_ssh_public_key: ${{ secrets.VM_SSH_PUBLIC_KEY }}
+        run: |
+          if [ "${{ github.event.inputs.action }}" == "destroy" ]; then
+            terraform plan -destroy -out=tfplan
+          else
+            terraform plan -out=tfplan
+          fi
+
+      - name: Terraform Apply / Destroy
+        working-directory: ${{ env.TF_WORKING_DIR }}
+        run: terraform apply -auto-approve tfplan
+
+      - name: Capture Terraform outputs
+        id: tf_output
+        if: ${{ github.event.inputs.action != 'destroy' }}
+        working-directory: ${{ env.TF_WORKING_DIR }}
+        run: |
+          echo "bastion_ip=$(terraform output -raw bastion_public_ip)" >> $GITHUB_OUTPUT
+          echo "app_vm_1_ip=$(terraform output -raw app_vm_1_private_ip 2>/dev/null || echo '')" >> $GITHUB_OUTPUT
+          echo "app_vm_2_ip=$(terraform output -raw app_vm_2_private_ip 2>/dev/null || echo '')" >> $GITHUB_OUTPUT
+          echo "lb_ip=$(terraform output -raw lb_public_ip)" >> $GITHUB_OUTPUT
+
+  # ─────────────────────────────────────────────────────
+  # JOB 3: Ansible Provision — install Docker, pull ACR image, run container
+  # Equivalent of: Ansible Provision → Docker on EC2 instances
+  # ─────────────────────────────────────────────────────
+  ansible:
+    name: Ansible Provision VMs
+    runs-on: ubuntu-latest
+    needs: [build-and-push, terraform]
+    if: ${{ github.event.inputs.action != 'destroy' }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install Ansible
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y ansible
+
+      - name: Write SSH private key
+        # Equivalent of: EC2_PRIVATE_SSH_KEY secret for Ansible SSH via Bastion
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.VM_SSH_PRIVATE_KEY }}" > ~/.ssh/id_rsa
+          chmod 400 ~/.ssh/id_rsa
+          ssh-keyscan -H ${{ needs.terraform.outputs.bastion_ip }} >> ~/.ssh/known_hosts 2>/dev/null || true
+
+      - name: Generate Ansible inventory
+        # Mirrors the hosts file — routes through bastion to reach private VMs
+        run: |
+          cat > ansible/hosts << EOF
+          [proxy]
+          app-vm-1 ansible_host=${{ needs.terraform.outputs.app_vm_1_ip }} ansible_user=azureuser ansible_ssh_common_args='-o StrictHostKeyChecking=no -o ProxyJump=azureuser@${{ needs.terraform.outputs.bastion_ip }}'
+          app-vm-2 ansible_host=${{ needs.terraform.outputs.app_vm_2_ip }} ansible_user=azureuser ansible_ssh_common_args='-o StrictHostKeyChecking=no -o ProxyJump=azureuser@${{ needs.terraform.outputs.bastion_ip }}'
+          EOF
+
+      - name: Run Ansible Docker Playbook
+        working-directory: ansible
+        env:
+          ANSIBLE_PRIVATE_KEY_FILE: ~/.ssh/id_rsa
+          ANSIBLE_HOST_KEY_CHECKING: "False"
+        run: |
+          ansible-playbook docker_playbook.yml \
+            --private-key ~/.ssh/id_rsa \
+            --extra-vars "acr_login_server=${{ secrets.ACR_LOGIN_SERVER }} \
+                          acr_username=${{ secrets.ACR_USERNAME }} \
+                          acr_password=${{ secrets.ACR_PASSWORD }} \
+                          image_tag=${{ needs.build-and-push.outputs.image_tag }}"
+
+      - name: Print App URL
+        run: |
+          echo "✅ Deployment complete!"
+          echo "🌐 App is live at: http://${{ needs.terraform.outputs.lb_ip }}"
+          echo "(May take ~2 min for LB health checks to pass)"
